@@ -106,7 +106,7 @@ async def match_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     response = client.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=1000,
+        max_tokens=2000,
         system=SYSTEM_PROMPT,
         tools=[{"type": "web_search_20250305", "name": "web_search"}],
         messages=[{"role": "user", "content": f"Матч: {query}"}],
