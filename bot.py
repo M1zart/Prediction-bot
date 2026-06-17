@@ -1,13 +1,17 @@
 import os
 import re
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from anthropic import Anthropic
 
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 
 client = Anthropic(api_key=ANTHROPIC_API_KEY)
+
+# Временное хранилище последнего анализа/текста для каждого чата,
+# чтобы кнопки могли прислать нужный блок отдельным сообщением
+LAST_RESULT = {}
 
 SYSTEM_PROMPT = """Ты — трейдер букмекерской конторы с опытом в риск-менеджменте 
 и оценке спортивных событий.
@@ -45,9 +49,9 @@ SYSTEM_PROMPT = """Ты — трейдер букмекерской контор
 - Не путай данные текущего турнира с прошлыми турнирами 
   (например ЧМ-2022) — указывай источник/период данных явно, 
   если используешь историческую статистику.
-- Каждый пункт в Шаге 1 должен содержать минимум одну конкретную 
-  цифру (статистика, дата, результат матча со счётом) — не 
-  ограничивайся общими формулировками типа "делает ставку на 
+- Каждый пункт оценки команд должен содержать минимум одну 
+  конкретную цифру (статистика, дата, результат матча со счётом) — 
+  не ограничивайся общими формулировками типа "делает ставку на 
   организацию" или "агрессивный стиль" без подтверждающих данных.
 
 КРИТИЧЕСКИ ВАЖНО — ИЩИ VALUE, НЕ ПРОСТО ФАВОРИТА:
@@ -69,44 +73,51 @@ SYSTEM_PROMPT = """Ты — трейдер букмекерской контор
 существенных факторов value") вместо того чтобы искусственно 
 придумывать сенсацию. Но если есть реальный сигнал, что исход 
 менее предсказуем, чем кажется на первый взгляд — это должно 
-явно отразиться в Шаге 2 и в итоговом счёте (например через 
-более скромную победу фаворита, точную разницу голов, или 
-даже неожиданный исход, если факторы это поддерживают).
+явно отразиться в сценарии матча и в итоговом счёте (например 
+через более скромную победу фаворита, точную разницу голов, 
+или даже неожиданный исход, если факторы это поддерживают).
 
-ОТВЕТ (две части, строго в этом порядке):
+ФОРМАТ ОТВЕТА — строго следуй этой структуре, без слов "часть", 
+"шаг" или их номеров где-либо в тексте:
 
-ЧАСТЬ 1 — АНАЛИЗ (для себя):
+*Анализ*
 
-ШАГ 1 — ОЦЕНКА КОМАНД (порознь):
-Команда 1 — атака: [ожидаемая результативность и почему, 
-1-2 предложения на основе исследования]
-Команда 1 — оборона: [насколько уязвима и почему]
+*[Название команды 1] — атака:* [ожидаемая результативность 
+и почему, 1-2 предложения на основе исследования]
+*[Название команды 1] — оборона:* [насколько уязвима и почему]
 
-Команда 2 — атака: [ожидаемая результативность и почему]
-Команда 2 — оборона: [насколько надёжна и почему]
+*[Название команды 2] — атака:* [ожидаемая результативность 
+и почему]
+*[Название команды 2] — оборона:* [насколько надёжна и почему]
 
-ШАГ 2 — СЦЕНАРИЙ МАТЧА:
-[2-3 предложения: как видишь развитие матча на основе 
-оценок из шага 1 — кто будет давить, кто защищаться, 
-где вероятны голы]
+*Сценарий:* [2-3 предложения: как видишь развитие матча на 
+основе оценок выше — кто будет давить, кто защищаться, где 
+вероятны голы, включая разбор value-вопроса]
 
-ШАГ 3 — ВЫВОД:
-Прогноз: [точный счёт — должен логически следовать из 
-шагов 1 и 2, а не выбираться первым]
-Уверенность: [низкая / средняя / высокая]
-Риск: [1 предложение — что может сломать сценарий]
+*Прогноз:* [точный счёт — должен логически следовать из 
+анализа выше, а не выбираться первым]
+*Уверенность:* [низкая / средняя / высокая]
+*Риск:* [1 предложение — что может сломать сценарий]
 
-ЧАСТЬ 2 — ТЕКСТ ДЛЯ ПОСТА:
-Готовый текст (4-6 предложений, разговорный стиль, как 
-комментарий эксперта) на основе шагов 1-3: объясни сценарий 
+###ПОСТ###
+
+[Готовый текст, 4-6 предложений, разговорный стиль, как 
+комментарий эксперта, на основе анализа выше: объясни сценарий 
 матча, счёт упомяни в конце как логичный итог рассказа, а не 
-как заголовок. Без заголовков, без звёздочек и другой разметки, 
-без эмодзи, без слов "шаг 1/2/3" — связный текст.
+как заголовок. Без заголовков, без звёздочек, без эмодзи — 
+связный текст без какой-либо разметки.]
 
 ПРАВИЛА:
-- Никогда не используй символы ** или другую markdown-разметку 
-  ни в одной части ответа — только обычный текст
-- Счёт в шаге 3 должен быть следствием анализа в шагах 1-2, 
+- Используй разметку *текст* (одна звёздочка с каждой стороны) 
+  ТОЛЬКО для заголовков команд, "Анализ", "Сценарий", "Прогноз", 
+  "Уверенность", "Риск" — это превратится в жирный текст в 
+  Telegram. Не используй ** (двойные звёздочки) — это не 
+  поддерживается.
+- В блоке после ###ПОСТ### никакой разметки звёздочками не 
+  используй вообще — это обычный текст для копирования
+- Строка "###ПОСТ###" должна присутствовать ровно один раз, 
+  отдельной строкой, без дополнительного текста на ней
+- Счёт в прогнозе должен быть следствием анализа выше, 
   а не выбран первым с подгонкой объяснения под него
 - Оценки команд должны быть специфичны для этого матча, 
   не общие фразы типа "команда в хорошей форме"
@@ -115,23 +126,39 @@ SYSTEM_PROMPT = """Ты — трейдер букмекерской контор
 - Не выдумывай статистику, составы, травмы — если данных нет, 
   скажи прямо
 - Без эмоций ("болею", "думаю") — только аналитика трейдера
-- Часть 1 — кратко, 4-5 предложений максимум
 - Все имена игроков, названия команд и клубов пиши кириллицей 
   (транслитерация), например "Араухо", "Де Аррасаэта", 
   "Аль-Даусари" — не латиницей
-
-ВАЖНО: твой ответ должен быть готов к прямой публикации в Telegram 
-как обычный текст. Символы *, #, _, > , markdown-заголовки и 
-разделители (---) запрещены везде в ответе."""
+- Никаких символов #, _, > , markdown-заголовков или 
+  разделителей (---) нигде в ответе"""
 
 
-def clean_markdown(text: str) -> str:
+def clean_text(text: str) -> str:
     text = re.sub(r"^#+\s*", "", text, flags=re.MULTILINE)
     text = re.sub(r"^-{3,}\s*$", "", text, flags=re.MULTILINE)
     text = re.sub(r"^>\s*", "", text, flags=re.MULTILINE)
-    text = text.replace("**", "")
+    text = text.replace("**", "*")
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
+
+
+def split_analysis_and_post(full_text: str):
+    """Разделяет ответ модели на блок анализа и блок текста для поста по маркеру ###ПОСТ###."""
+    if "###ПОСТ###" in full_text:
+        analysis, post = full_text.split("###ПОСТ###", 1)
+    else:
+        analysis, post = full_text, ""
+    return analysis.strip(), post.strip()
+
+
+def build_keyboard():
+    keyboard = [
+        [
+            InlineKeyboardButton("📋 Скопировать анализ", callback_data="copy_analysis"),
+            InlineKeyboardButton("📋 Скопировать текст для поста", callback_data="copy_post"),
+        ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
 
 
 async def match_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -142,6 +169,7 @@ async def match_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     query = " ".join(context.args)
+    chat_id = update.effective_chat.id
     await update.message.reply_text("Анализирую матч, минута...")
 
     response = client.messages.create(
@@ -154,16 +182,46 @@ async def match_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text_parts = [block.text for block in response.content if block.type == "text"]
     result = "\n".join(text_parts)
-    result = clean_markdown(result)
+    result = clean_text(result)
+
+    analysis, post = split_analysis_and_post(result)
+    LAST_RESULT[chat_id] = {"analysis": analysis, "post": post}
 
     max_len = 4000
-    for i in range(0, len(result), max_len):
-        await update.message.reply_text(result[i:i + max_len])
+    for i in range(0, len(analysis), max_len):
+        chunk = analysis[i:i + max_len]
+        is_last = i + max_len >= len(analysis)
+        await update.message.reply_text(
+            chunk,
+            parse_mode="Markdown",
+            reply_markup=build_keyboard() if is_last else None,
+        )
+
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    chat_id = query.message.chat_id
+    await query.answer()
+
+    data = LAST_RESULT.get(chat_id)
+    if not data:
+        await query.message.reply_text("Нет сохранённого анализа. Сделай новый запрос /match.")
+        return
+
+    if query.data == "copy_analysis":
+        text = data["analysis"] or "Анализ пуст."
+        await query.message.reply_text(text, parse_mode="Markdown")
+    elif query.data == "copy_post":
+        text = data["post"] or "Текст для поста пуст."
+        max_len = 4000
+        for i in range(0, len(text), max_len):
+            await query.message.reply_text(text[i:i + max_len])
 
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("match", match_command))
+    app.add_handler(CallbackQueryHandler(button_callback))
     app.run_polling()
 
 
